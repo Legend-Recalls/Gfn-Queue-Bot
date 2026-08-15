@@ -367,6 +367,13 @@ function dedupeGames(games: GameInfo[]): GameInfo[] {
       mergedVariants.set(variant.id, variant);
     }
 
+    const mergedVariantsList = [...mergedVariants.values()];
+    const selectedVariantId =
+      existing.variants[existing.selectedVariantIndex]?.id ??
+      game.variants[game.selectedVariantIndex]?.id;
+    const selectedVariantIndex = selectedVariantId
+      ? mergedVariantsList.findIndex((variant) => variant.id === selectedVariantId)
+      : -1;
     const merged: GameInfo = {
       ...existing,
       ...game,
@@ -380,10 +387,8 @@ function dedupeGames(games: GameInfo[]): GameInfo[] {
       developerName: existing.developerName ?? game.developerName,
       availableStores: [...new Set([...(existing.availableStores ?? []), ...(game.availableStores ?? [])])],
       searchText: [existing.searchText, game.searchText].filter(Boolean).join(" ").trim() || undefined,
-      selectedVariantIndex: Math.max(0, existing.variants[existing.selectedVariantIndex]
-        ? [...mergedVariants.values()].findIndex((variant) => variant.id === existing.variants[existing.selectedVariantIndex]?.id)
-        : game.selectedVariantIndex),
-      variants: [...mergedVariants.values()],
+      selectedVariantIndex: selectedVariantIndex >= 0 ? selectedVariantIndex : 0,
+      variants: mergedVariantsList,
     };
 
     byId.set(game.id, merged);

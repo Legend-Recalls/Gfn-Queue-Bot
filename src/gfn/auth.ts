@@ -210,7 +210,7 @@ function generatePkce(): { verifier: string; challenge: string } {
   return { verifier, challenge };
 }
 
-function buildAuthUrl(provider: LoginProvider, challenge: string, port: number): string {
+function buildAuthUrl(provider: LoginProvider, challenge: string, port: number, state: string): string {
   const redirectUri = `http://localhost:${port}`;
   const nonce = randomBytes(16).toString("hex");
   const params = new URLSearchParams({
@@ -221,6 +221,7 @@ function buildAuthUrl(provider: LoginProvider, challenge: string, port: number):
     redirect_uri: redirectUri,
     ui_locales: "en_US",
     nonce,
+    state,
     prompt: "select_account",
     code_challenge: challenge,
     code_challenge_method: "S256",
@@ -245,20 +246,27 @@ async function findAvailablePort(): Promise<number> {
   throw new Error("No available OAuth callback ports");
 }
 
-function waitForAuthorizationCode(port: number, timeoutMs: number): Promise<string> {
+function waitForAuthorizationCode(port: number, timeoutMs: number, expectedState: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const server = createServer((request: IncomingMessage, response: ServerResponse) => {
       const url = new URL(request.url ?? "/", `http://localhost:${port}`);
       const code = url.searchParams.get("code");
       const error = url.searchParams.get("error");
+      const callbackState = url.searchParams.get("state");
+      const validCode = Boolean(code && callbackState === expectedState);
+      const failureReason = !code
+        ? error ?? "Authorization failed"
+        : callbackState !== expectedState
+          ? "Invalid OAuth state"
+          : "Authorization failed";
 
       const html = `<!doctype html><html><head><meta charset="utf-8"><title>OpenNOW Queue Bot Login</title></head>
 <body style="font-family:Segoe UI,Arial,sans-serif;background:#0b1220;color:#dbe7ff;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
 <div style="background:#111a2c;padding:28px 32px;border:1px solid #30425f;border-radius:14px;max-width:480px;text-align:center">
-<h2 style="margin-top:0">${code ? "Login complete" : "Login failed"}</h2>
-<p>${code
+<h2 style="margin-top:0">${validCode ? "Login complete" : "Login failed"}</h2>
+<p>${validCode
   ? "You can close this window and return to the OpenNOW Queue Bot dashboard."
-  : `Reason: ${error ?? "unknown"}. You can close this window and try again from the dashboard.`}</p>
+  : `Reason: ${failureReason}. You can close this window and try again from the dashboard.`}</p>
 </div></body></html>`;
 
       response.statusCode = 200;
@@ -266,8 +274,8 @@ function waitForAuthorizationCode(port: number, timeoutMs: number): Promise<stri
       response.end(html);
 
       server.close(() => {
-        if (code) resolve(code);
-        else reject(new Error(error ?? "Authorization failed"));
+        if (validCode) resolve(code as string);
+        else reject(new Error(failureReason));
       });
     });
 
@@ -516,14 +524,15 @@ export class AuthManager {
       defaultProvider();
 
     const { verifier, challenge } = generatePkce();
+    const state = randomBytes(32).toString("hex");
     const port = await findAvailablePort();
-    const authUrl = buildAuthUrl(selected, challenge, port);
+    const authUrl = buildAuthUrl(selected, challenge, port, state);
 
     console.log(`[Auth] Open this URL in a browser to log in (account will bind to provider: ${selected.displayName}):`);
     console.log(`[Auth] ${authUrl}`);
     options.openBrowser?.(authUrl);
 
-    const code = await waitForAuthorizationCode(port, OAUTH_TIMEOUT_MS);
+    const code = await waitForAuthorizationCode(port, OAUTH_TIMEOUT_MS, state);
     let tokens = await exchangeAuthorizationCode(code, verifier, port);
     const user = await fetchUserInfo(tokens);
     try {

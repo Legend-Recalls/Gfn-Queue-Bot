@@ -155,13 +155,12 @@ export class AccountBot extends EventEmitter {
 
   async stop(): Promise<void> {
     this.stopping = true;
+    this.queueRequested = false;
     this.clearTimer();
     if (this.status.sessionId && this.status.phase !== "claimed") {
       try {
         const token = await this.auth.resolveToken(this.userId);
-        const base = this.status.serverIp
-          ? `https://${this.status.serverIp}`
-          : this.status.streamingBaseUrl ?? this.streamingBaseUrl;
+        const base = this.status.streamingBaseUrl ?? this.streamingBaseUrl;
         await stopSession({
           token,
           sessionId: this.status.sessionId,
@@ -182,7 +181,7 @@ export class AccountBot extends EventEmitter {
    * Returns null if this account is not currently in holding phase.
    */
   claim(): ClaimInfo | null {
-    if (this.status.phase !== "holding") return null;
+    if (!this.isClaimable) return null;
     if (!this.status.sessionId || !this.status.holdStartedAt || !this.status.holdExpiresAt) return null;
 
     const claimedAt = Date.now();
@@ -272,9 +271,11 @@ export class AccountBot extends EventEmitter {
   /** Whether this account's session is past the buffer and ready to be claimed. */
   get isClaimable(): boolean {
     if (this.status.phase !== "holding") return false;
-    if (!this.status.holdStartedAt) return false;
+    if (!this.status.holdStartedAt || !this.status.holdExpiresAt) return false;
+    const now = Date.now();
+    if (now >= this.status.holdExpiresAt) return false;
     const bufferMs = this.config.sessionBufferMs ?? DEFAULT_SESSION_BUFFER_MS;
-    return Date.now() - this.status.holdStartedAt >= bufferMs;
+    return now - this.status.holdStartedAt >= bufferMs;
   }
 
   /** Milliseconds remaining in the hold window, or 0 if not holding. */
@@ -347,6 +348,13 @@ export class AccountBot extends EventEmitter {
       }
 
       await this.rateLimiter?.acquire(this.userId);
+      if (
+        this.stopping ||
+        !this.queueRequested ||
+        this.status.phase === "paused"
+      ) {
+        return;
+      }
       const token = await this.auth.resolveToken(this.userId);
 
       if (!this.status.sessionId) {
@@ -530,8 +538,7 @@ export class AccountBot extends EventEmitter {
       await this.onReachedReady(info);
     } else {
       const maxMs = this.config.maxQueueMs ?? DEFAULT_MAX_QUEUE_MS;
-      const hasLiveQueuePosition = typeof this.status.queuePosition === "number" && this.status.queuePosition > 0;
-      if (maxMs > 0 && !hasLiveQueuePosition && this.status.startedAt && Date.now() - this.status.startedAt > maxMs) {
+      if (maxMs > 0 && this.status.startedAt && Date.now() - this.status.startedAt > maxMs) {
         console.warn(`[Bot:${this.userId}] hit maxQueueMs; ending session`);
         await this.endCurrentSession("stopped", "Hit max queue time");
       }
@@ -683,7 +690,6 @@ export class AccountBot extends EventEmitter {
   private async endCurrentSession(outcome: "ready" | "stopped", errorMessage?: string): Promise<void> {
     if (!this.status.sessionId) return;
     this.setStatus({ phase: "ending" });
-    const token = await this.auth.resolveToken(this.userId);
     const sampleUpdate: Partial<QueueSample> = { outcome, endedAt: Date.now() };
     if (errorMessage) sampleUpdate.errorMessage = errorMessage;
     this.metrics.updateSample(
@@ -691,9 +697,8 @@ export class AccountBot extends EventEmitter {
       sampleUpdate,
     );
     try {
-      const base = this.status.serverIp
-        ? `https://${this.status.serverIp}`
-        : this.status.streamingBaseUrl ?? this.streamingBaseUrl;
+      const token = await this.auth.resolveToken(this.userId);
+      const base = this.status.streamingBaseUrl ?? this.streamingBaseUrl;
       await stopSession({
         token,
         sessionId: this.status.sessionId,
@@ -715,7 +720,9 @@ export class AccountBot extends EventEmitter {
       holdExpiresAt: undefined,
       cooldownUntil: Date.now() + (this.config.cooldownMs ?? DEFAULT_COOLDOWN_MS),
     });
-    this.queueRequested = false;
+    if (!this.stopping) {
+      this.queueRequested = true;
+    }
     this.holdReadyEmitted = false;
     this.scheduleNext(this.config.cooldownMs ?? DEFAULT_COOLDOWN_MS);
     this.emit("hold-ended", { ...this.status, reason: outcome });

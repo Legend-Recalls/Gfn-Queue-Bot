@@ -50,6 +50,45 @@ async function api(path, options = {}) {
   return res.json();
 }
 
+function queueDurationMs(sample) {
+  if (!sample || typeof sample.startedAt !== "number" || typeof sample.reachedReadyAt !== "number") return null;
+  const duration = sample.reachedReadyAt - sample.startedAt;
+  return duration >= 0 ? duration : null;
+}
+
+function readNumber(id, fallback) {
+  const value = Number($(id).value);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function renderOverview() {
+  const accounts = state.accounts ?? [];
+  const enabledIds = new Set(state.config?.enabledAccountIds ?? []);
+  const enabled = accounts.filter((account) => enabledIds.has(account.userId));
+  const queueing = enabled.filter((account) => ["starting", "queueing"].includes(account.phase)).length;
+  const ready = enabled.filter((account) => ["holding", "ready"].includes(account.phase)).length;
+  const claimed = enabled.filter((account) => account.phase === "claimed").length;
+  const completed = (state.metrics ?? []).reduce((sum, metric) => sum + (metric.readyCount ?? 0), 0);
+  const best = (state.metrics ?? []).find((metric) => metric.readyCount > 0);
+  const target = state.config?.appId || "No game selected";
+
+  $("overview-target").textContent = target;
+  $("overview-active").textContent = `${queueing}/${enabled.length}`;
+  $("overview-active-detail").textContent = enabled.length === 0
+    ? "Enable accounts to build the queue pipeline"
+    : `${enabled.length - queueing} enabled account${enabled.length - queueing === 1 ? "" : "s"} waiting for a slot`;
+  $("overview-ready").textContent = String(ready + claimed);
+  $("overview-ready-detail").textContent = claimed > 0
+    ? `${claimed} claimed · ${ready} still available`
+    : "Held sessions ready for the next click";
+  $("overview-best").textContent = best?.p50QueueMs != null ? fmtMs(best.p50QueueMs) : "—";
+  $("overview-best-detail").textContent = best?.userId
+    ? `Best p50 · ${best.userId.slice(0, 10)}`
+    : "Needs completed queue samples";
+  $("overview-samples").textContent = String(completed);
+  $("overview-samples-detail").textContent = completed === 1 ? "Completed queue result" : "Completed queue results";
+}
+
 function renderConfig() {
   const c = state.config ?? {};
   $("cfg-appId").value = c.appId ?? "";
@@ -227,7 +266,7 @@ function renderRecent() {
     const account = accountById.get(s.userId);
     const name = account?.displayName ?? s.userId.slice(0, 8);
     const tr = document.createElement("tr");
-    const queueMs = s.reachedReadyAt && s.startedAt ? s.reachedReadyAt - s.startedAt : null;
+    const queueMs = queueDurationMs(s);
     tr.innerHTML = `
       <td>${fmtTime(s.startedAt)}</td>
       <td>${escapeHtml(name)}</td>
@@ -241,6 +280,7 @@ function renderRecent() {
 }
 
 function render() {
+  renderOverview();
   renderConfig();
   renderProviders();
   renderAccounts();
@@ -472,16 +512,16 @@ async function saveConfig() {
     appId: $("cfg-appId").value.trim(),
     zone: $("cfg-zone").value.trim() || undefined,
     resolution: $("cfg-resolution").value.trim() || "1920x1080",
-    fps: Number($("cfg-fps").value) || 60,
-    pollIntervalMs: Number($("cfg-poll").value) || 4000,
-    cooldownMs: Number($("cfg-cooldown").value) || 20000,
-    maxQueueMs: Number($("cfg-max").value) || 1800000,
-    maxConcurrentHolding: Number($("cfg-maxConcurrentHolding").value) || 2,
-    maxConcurrentQueueing: Number($("cfg-maxConcurrentQueueing").value) || 64,
-    staggerDelayMs: Number($("cfg-staggerDelay").value) || 720000,
-    preemptiveQueueMs: Number($("cfg-preemptive").value) || 600000,
-    sessionHoldMs: Number($("cfg-sessionHold").value) || 3300000,
-    sessionBufferMs: Number($("cfg-sessionBuffer").value) || 300000,
+    fps: readNumber("cfg-fps", 60),
+    pollIntervalMs: readNumber("cfg-poll", 4000),
+    cooldownMs: readNumber("cfg-cooldown", 20000),
+    maxQueueMs: readNumber("cfg-max", 1800000),
+    maxConcurrentHolding: readNumber("cfg-maxConcurrentHolding", 2),
+    maxConcurrentQueueing: readNumber("cfg-maxConcurrentQueueing", 64),
+    staggerDelayMs: readNumber("cfg-staggerDelay", 720000),
+    preemptiveQueueMs: readNumber("cfg-preemptive", 600000),
+    sessionHoldMs: readNumber("cfg-sessionHold", 3300000),
+    sessionBufferMs: readNumber("cfg-sessionBuffer", 300000),
   };
   state.config = await api("/api/config", { method: "POST", body: patch });
   render();
@@ -591,7 +631,7 @@ function renderRotation() {
   container.innerHTML = "";
   
   const holding = state.accounts.filter(
-    (a) => a.phase === "ready" || a.phase === "holding" || a.phase === "claimed"
+    (a) => a.phase === "holding" || a.phase === "claimed"
   );
   
   if (holding.length === 0) {
@@ -600,28 +640,29 @@ function renderRotation() {
   }
   
   for (const a of holding) {
-    const isBuffer = a.isBuffering === true;
-    const bufferLimit = (state.config?.sessionBufferMs ?? 300000);
+    const isClaimed = a.phase === "claimed";
+    const bufferLimit = state.config?.sessionBufferMs ?? 300000;
     const reached = a.reachedReadyAt ?? Date.now();
-    const elapsed = Date.now() - reached;
-    const bufferRemaining = Math.max(0, bufferLimit - elapsed);
+    const bufferUntil = reached + bufferLimit;
+    const isBuffer = !isClaimed && a.phase === "holding" && bufferLimit > 0 && Date.now() < bufferUntil;
+    const bufferRemaining = Math.max(0, bufferUntil - Date.now());
     const holdRemaining = Math.max(0, (a.holdExpiresAt ?? Date.now()) - Date.now());
-    
+
     const node = document.createElement("div");
-    node.className = `session-card${!isBuffer ? " ready-to-claim" : ""}`;
+    node.className = `session-card${!isBuffer && !isClaimed ? " ready-to-claim" : ""}${isClaimed ? " claimed-session" : ""}`;
     node.id = `rotation-session-${a.userId}`;
     
     let timerHtml = "";
     if (isBuffer) {
       timerHtml = `
-        <div class="hint">Game loading buffer...</div>
-        <div class="buffer-countdown" data-timestamp="${reached + bufferLimit}" data-type="buffer">
+        <div class="hint">Ready buffer · claim unlocks in</div>
+        <div class="buffer-countdown" data-timestamp="${bufferUntil}" data-type="buffer">
           ${fmtMs(bufferRemaining)}
         </div>
       `;
     } else {
       timerHtml = `
-        <div class="hint">Time remaining in hold window:</div>
+        <div class="hint">${isClaimed ? "User-managed hold window" : "Time remaining in hold window"}</div>
         <div class="time-remaining" data-timestamp="${a.holdExpiresAt}" data-type="hold">
           ${fmtMs(holdRemaining)}
         </div>
@@ -645,18 +686,20 @@ function renderRotation() {
           : `<span class="warning">No GFN profile assigned</span>`
         }
       </div>
-      
+
       ${timerHtml}
-      
+
       <div class="actions">
-        ${isBuffer 
-          ? `<button class="claim-btn" disabled>Waiting for Buffer...</button>`
-          : hasProfile
-            ? `
-              <button class="ghost" data-action="rotation-switch" data-uid="${a.userId}">Switch</button>
-              <button class="claim-btn" data-action="play" data-uid="${a.userId}">Play</button>
-            `
-            : `<button class="claim-btn" disabled style="opacity: 0.6;" title="Assign a GFN Profile in the Accounts section first">Assign GFN Profile to Play</button>`
+        ${isClaimed
+          ? `<span class="hint">Detached · this session is user-managed</span>`
+          : isBuffer
+            ? `<button class="claim-btn" disabled>Unlocking soon</button>`
+            : hasProfile
+              ? `
+                <button class="ghost" data-action="rotation-switch" data-uid="${a.userId}">Switch</button>
+                <button class="claim-btn" data-action="play" data-uid="${a.userId}">Play</button>
+              `
+              : `<button class="claim-btn" disabled style="opacity: 0.6;" title="Assign a GFN Profile in the Accounts section first">Assign GFN Profile to Play</button>`
         }
       </div>
     `;
@@ -725,12 +768,14 @@ function updateTimers() {
     
     if (type === "buffer") {
       el.textContent = fmtMs(remaining);
-      if (remaining <= 0) {
+      if (remaining <= 0 && !el.dataset.expired) {
+        el.dataset.expired = "1";
         loadState().catch(() => {});
       }
     } else if (type === "hold") {
       el.textContent = fmtMs(remaining);
-      if (remaining <= 0) {
+      if (remaining <= 0 && !el.dataset.expired) {
+        el.dataset.expired = "1";
         loadState().catch(() => {});
       }
     }

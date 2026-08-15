@@ -8,8 +8,9 @@
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
     "build": "tsc",
-    "start:prod": "node dist/index.js"
+    "start:prod": "node dist/src/index.js"
   },
   "dependencies": {
     "ws": "^8.21.0"

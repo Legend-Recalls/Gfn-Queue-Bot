@@ -103,15 +103,23 @@ export class MetricsStore {
     for (const [key, list] of byKey.entries()) {
       const [uid, aid] = key.split("::");
       if (!uid || !aid) continue;
-      const readyOrClaimed = list.filter((s) => (s.outcome === "ready" || s.outcome === "claimed") && s.reachedReadyAt);
-      const queueMs = readyOrClaimed
+      // Keep successful queue times in the ranking even after the held session
+      // is later stopped or expires.
+      const readySamples = list.filter(
+        (s) =>
+          typeof s.reachedReadyAt === "number" &&
+          s.reachedReadyAt >= s.startedAt &&
+          s.outcome !== "error" &&
+          s.outcome !== "rate_limited",
+      );
+      const queueMs = readySamples
         .map((s) => (s.reachedReadyAt as number) - s.startedAt)
         .sort((a, b) => a - b);
       out.push({
         userId: uid,
         appId: aid,
         sampleCount: list.length,
-        readyCount: readyOrClaimed.length,
+        readyCount: readySamples.length,
         claimedCount: list.filter((s) => s.outcome === "claimed").length,
         errorCount: list.filter((s) => s.outcome === "error" || s.outcome === "rate_limited").length,
         avgQueueMs: queueMs.length === 0 ? null : queueMs.reduce((a, b) => a + b, 0) / queueMs.length,
@@ -119,7 +127,10 @@ export class MetricsStore {
         p95QueueMs: queueMs.length === 0 ? null : percentile(queueMs, 0.95),
         fastestQueueMs: queueMs.length === 0 ? null : queueMs[0] ?? null,
         lastSampleAt: list[list.length - 1]?.startedAt ?? null,
-        lastReadyAt: readyOrClaimed[readyOrClaimed.length - 1]?.reachedReadyAt ?? null,
+        lastReadyAt: readySamples.reduce<number | null>(
+          (latest, sample) => Math.max(latest ?? Number.NEGATIVE_INFINITY, sample.reachedReadyAt as number),
+          null,
+        ),
         bestPositionReached: list
           .map((s) => s.reachedReadyQueuePosition)
           .filter((q): q is number => typeof q === "number")
@@ -141,6 +152,12 @@ export class MetricsStore {
 
 function percentile(sorted: number[], p: number): number {
   if (sorted.length === 0) return 0;
-  const idx = Math.min(sorted.length - 1, Math.floor(p * sorted.length));
-  return sorted[idx] ?? 0;
+  if (sorted.length === 1) return sorted[0] ?? 0;
+
+  const position = (sorted.length - 1) * p;
+  const lowerIndex = Math.floor(position);
+  const upperIndex = Math.ceil(position);
+  const lower = sorted[lowerIndex] ?? 0;
+  const upper = sorted[upperIndex] ?? lower;
+  return lower + (upper - lower) * (position - lowerIndex);
 }

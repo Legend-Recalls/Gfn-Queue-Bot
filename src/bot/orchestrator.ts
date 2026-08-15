@@ -62,6 +62,8 @@ export class BotOrchestrator extends EventEmitter {
   private evaluateTimeout: NodeJS.Timeout | null = null;
   private readonly fingerprintManager: FingerprintManager;
   private readonly rateLimiter: RateLimiter;
+  private botConfigKeys = new Map<string, string>();
+  private restartingBotIds = new Set<string>();
 
   constructor(
     private readonly auth: AuthManager,
@@ -168,31 +170,49 @@ export class BotOrchestrator extends EventEmitter {
       if (!isEnabled) continue;
       keepUserIds.add(account.user.userId);
 
+      const desiredBotConfig = this.createBotConfig(account);
+      const desiredConfigKey = JSON.stringify(desiredBotConfig);
       const existing = this.bots.get(account.user.userId);
       if (existing) {
         if (
-          existing.status.appId !== this.config.appId ||
-          existing.status.pollIntervalMs !== this.config.pollIntervalMs
+          this.botConfigKeys.get(account.user.userId) !== desiredConfigKey &&
+          !this.restartingBotIds.has(account.user.userId)
         ) {
-          void existing.stop().then(() => this.spawnBot(account));
+          this.restartingBotIds.add(account.user.userId);
+          void existing.stop()
+            .then(() => {
+              if (this.bots.get(account.user.userId) !== existing) return;
+              this.bots.delete(account.user.userId);
+              this.botConfigKeys.delete(account.user.userId);
+              this.spawnBot(account);
+            })
+            .catch((error) => {
+              console.warn(`[Orchestrator] failed to restart bot ${account.user.userId}:`, error);
+            })
+            .finally(() => this.restartingBotIds.delete(account.user.userId));
         }
         continue;
       }
-      this.spawnBot(account);
+      this.spawnBot(account, desiredBotConfig, desiredConfigKey);
     }
 
     for (const [userId, bot] of this.bots.entries()) {
       if (!keepUserIds.has(userId)) {
-        void bot.stop().finally(() => this.bots.delete(userId));
+        void bot.stop().finally(() => {
+          this.bots.delete(userId);
+          this.botConfigKeys.delete(userId);
+          this.restartingBotIds.delete(userId);
+        });
         this.bots.delete(userId);
+        this.botConfigKeys.delete(userId);
       }
     }
 
     this.triggerEvaluation();
   }
 
-  private spawnBot(account: StoredAccount): void {
-    const botConfig: AccountBotConfig = {
+  private createBotConfig(account: StoredAccount): AccountBotConfig {
+    return {
       appId: this.config.appId,
       pollIntervalMs: this.config.pollIntervalMs,
       maxQueueMs: this.config.maxQueueMs,
@@ -204,6 +224,13 @@ export class BotOrchestrator extends EventEmitter {
       sessionHoldMs: this.config.sessionHoldMs,
       sessionBufferMs: this.config.sessionBufferMs,
     };
+  }
+
+  private spawnBot(
+    account: StoredAccount,
+    botConfig = this.createBotConfig(account),
+    configKey = JSON.stringify(botConfig),
+  ): void {
     const fingerprint = this.fingerprintManager.getOrCreate(account.user.userId);
     const bot = new AccountBot(this.auth, this.metrics, account, botConfig, fingerprint, this.rateLimiter);
 
@@ -229,6 +256,7 @@ export class BotOrchestrator extends EventEmitter {
     });
 
     this.bots.set(account.user.userId, bot);
+    this.botConfigKeys.set(account.user.userId, configKey);
     this.triggerEvaluation();
   }
 
@@ -484,5 +512,7 @@ export class BotOrchestrator extends EventEmitter {
     }
     await Promise.all(Array.from(this.bots.values()).map((bot) => bot.stop()));
     this.bots.clear();
+    this.botConfigKeys.clear();
+    this.restartingBotIds.clear();
   }
 }

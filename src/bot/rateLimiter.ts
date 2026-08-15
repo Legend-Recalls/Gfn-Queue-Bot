@@ -3,7 +3,8 @@ export class RateLimiter {
   private maxTokens: number;
   private refillRateMs: number;
   private lastRefill: number;
-  private queue: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
+  private queue: Array<{ userId: string; resolve: () => void }> = [];
+  private processTimer: NodeJS.Timeout | null = null;
 
   // Track timestamps for spacing
   private lastGlobalRequestTime = 0;
@@ -24,59 +25,59 @@ export class RateLimiter {
    * Acquire a slot for the request. Resolves when the rate limit and spacing rules are satisfied.
    */
   async acquire(userId: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.queue.push({ resolve, reject });
-      this.processQueue(userId);
+    return new Promise((resolve) => {
+      this.queue.push({ userId, resolve });
+      this.scheduleProcess(0);
     });
   }
 
-  private processQueue(userId?: string): void {
+  private scheduleProcess(delayMs: number): void {
+    if (this.processTimer) return;
+    this.processTimer = setTimeout(() => {
+      this.processTimer = null;
+      this.processQueue();
+    }, delayMs);
+  }
+
+  private processQueue(): void {
     if (this.queue.length === 0) return;
 
     this.refill();
 
     const now = Date.now();
-    const globalSpacing = now - this.lastGlobalRequestTime;
-    const accountSpacing = userId ? now - (this.lastAccountRequestTime.get(userId) ?? 0) : this.MIN_PER_ACCOUNT_SPACING_MS;
+    const next = this.queue[0];
+    if (!next) return;
 
-    // Check tokens and spacing requirements
+    const globalSpacing = now - this.lastGlobalRequestTime;
+    const accountSpacing = now - (this.lastAccountRequestTime.get(next.userId) ?? 0);
+
     if (
       this.tokens >= 1 &&
       globalSpacing >= this.MIN_CROSS_ACCOUNT_SPACING_MS &&
       accountSpacing >= this.MIN_PER_ACCOUNT_SPACING_MS
     ) {
-      // Consume a token and record request time
       this.tokens -= 1;
       this.lastGlobalRequestTime = now;
-      if (userId) {
-        this.lastAccountRequestTime.set(userId, now);
-      }
+      this.lastAccountRequestTime.set(next.userId, now);
+      this.queue.shift();
+      next.resolve();
 
-      const next = this.queue.shift();
-      if (next) {
-        next.resolve();
-      }
-
-      // Process next item in queue asynchronously
       if (this.queue.length > 0) {
-        setTimeout(() => this.processQueue(), this.MIN_CROSS_ACCOUNT_SPACING_MS);
+        this.scheduleProcess(this.MIN_CROSS_ACCOUNT_SPACING_MS);
       }
-    } else {
-      // Determine how long to wait before trying again
-      const waitGlobal = Math.max(0, this.MIN_CROSS_ACCOUNT_SPACING_MS - globalSpacing);
-      const waitAccount = userId ? Math.max(0, this.MIN_PER_ACCOUNT_SPACING_MS - accountSpacing) : 0;
-      const waitToken = this.tokens < 1 ? this.refillRateMs : 0;
-
-      const waitMs = Math.max(waitGlobal, waitAccount, waitToken, 100);
-
-      setTimeout(() => this.processQueue(userId), waitMs);
+      return;
     }
+
+    const waitGlobal = Math.max(0, this.MIN_CROSS_ACCOUNT_SPACING_MS - globalSpacing);
+    const waitAccount = Math.max(0, this.MIN_PER_ACCOUNT_SPACING_MS - accountSpacing);
+    const waitToken = this.tokens < 1 ? this.refillRateMs : 0;
+    this.scheduleProcess(Math.max(waitGlobal, waitAccount, waitToken, 100));
   }
 
   private refill(): void {
     const now = Date.now();
     const elapsed = now - this.lastRefill;
-    if (elapsed > this.refillRateMs) {
+    if (elapsed >= this.refillRateMs) {
       const generated = Math.floor(elapsed / this.refillRateMs);
       this.tokens = Math.min(this.maxTokens, this.tokens + generated);
       this.lastRefill = now;
