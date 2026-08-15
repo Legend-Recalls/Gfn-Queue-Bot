@@ -1,0 +1,11 @@
+{
+  "bot": {
+    "appId": "101574611",
+    "pollIntervalMs": 4000,
+    "cooldownMs": 20000,
+    "maxQueueMs": 1800000,
+    "resolution": "1920x1080",
+    "fps": 60,
+    "enabledAccountIds": []
+  }
+}

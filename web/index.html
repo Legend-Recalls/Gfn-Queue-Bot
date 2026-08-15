@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>OpenNOW Queue Bot</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>OpenNOW Queue Bot</h1>
+    <p class="subtitle">Continuous GFN queue probe · multi-account ranking</p>
+  </header>
+
+  <main>
+    <section class="card" id="config-card">
+      <h2>Bot configuration</h2>
+      <div class="grid">
+        <label>Game
+          <input id="cfg-appId" placeholder="numeric appId (or UUID + resolve)" />
+        </label>
+        <label>Zone (optional)
+          <select id="cfg-zone">
+            <option value="">Default (Auto / Closest)</option>
+          </select>
+        </label>
+        <label>Resolution
+          <select id="cfg-resolution">
+            <option value="1920x1080">1920x1080 (1080p - Default)</option>
+            <option value="3840x2160">3840x2160 (4K)</option>
+            <option value="2560x1440">2560x1440 (1440p)</option>
+            <option value="1280x720">1280x720 (720p)</option>
+            <option value="2560x1600">2560x1600 (1600p 16:10)</option>
+            <option value="1920x1200">1920x1200 (1200p 16:10)</option>
+          </select>
+        </label>
+        <label>FPS
+          <select id="cfg-fps">
+            <option value="60">60 FPS (Default)</option>
+            <option value="30">30 FPS</option>
+            <option value="120">120 FPS</option>
+            <option value="240">240 FPS</option>
+          </select>
+        </label>
+        <label>Poll interval (ms)
+          <input id="cfg-poll" type="number" value="4000" min="1000" step="500" />
+        </label>
+        <label>Cooldown (ms)
+          <input id="cfg-cooldown" type="number" value="20000" min="1000" step="1000" />
+        </label>
+        <label>Max queue time (ms)
+          <input id="cfg-max" type="number" value="1800000" min="60000" step="60000" />
+        </label>
+        <label>Max holding sessions
+          <input id="cfg-maxConcurrentHolding" type="number" value="2" min="1" max="10" />
+        </label>
+        <label>Max concurrent queueing
+          <input id="cfg-maxConcurrentQueueing" type="number" value="64" min="1" max="64" />
+        </label>
+        <label>Stagger delay (ms)
+          <input id="cfg-staggerDelay" type="number" value="720000" min="0" step="60000" />
+        </label>
+        <label>Preemptive offset (ms)
+          <input id="cfg-preemptive" type="number" value="600000" min="0" step="60000" />
+        </label>
+        <label>Session hold time (ms)
+          <input id="cfg-sessionHold" type="number" value="3300000" min="0" step="60000" />
+        </label>
+        <label>Ready buffer (ms)
+          <input id="cfg-sessionBuffer" type="number" value="300000" min="0" step="60000" />
+        </label>
+      </div>
+      <div class="row">
+        <button id="btn-save-config" class="primary">Save</button>
+        <button id="btn-resolve" class="ghost">Resolve game (UUID → appId)</button>
+        <span class="hint" id="resolve-hint"></span>
+      </div>
+    </section>
+
+    <section class="card" id="game-search-card">
+      <h2>Search Games</h2>
+      <div class="row" style="margin-top: 0; display: flex; width: 100%;">
+        <input id="search-input" placeholder="Search for GFN games (e.g., Cyberpunk)" style="flex: 1;" />
+        <button id="btn-search-games" class="primary">Search games</button>
+      </div>
+      <div id="search-results-container" class="game-results"></div>
+      <p class="hint" id="search-hint"></p>
+    </section>
+
+    <section class="card" id="accounts-card">
+      <div class="card-header">
+        <h2>Accounts</h2>
+        <div>
+          <select id="login-provider"></select>
+          <button id="btn-login" class="primary">+ Add account</button>
+        </div>
+      </div>
+      <p class="hint" id="login-hint">Click "Add account" — a URL will be printed here and opened in your browser. Sign in once; tokens are saved locally.</p>
+      <div id="accounts-list" class="accounts"></div>
+    </section>
+
+    <section class="card" id="switcher-card">
+      <div class="card-header">
+        <h2>GFN Switcher</h2>
+        <button id="btn-new-gfn-login" class="ghost">New login</button>
+      </div>
+      <div class="switcher-actions">
+        <input id="gfn-profile-name" placeholder="Profile name" maxlength="80" />
+        <button id="btn-save-gfn-profile" class="primary">Save current login</button>
+      </div>
+      <div id="gfn-profile-list" class="profile-grid"></div>
+    </section>
+
+    <section class="card" id="rotation-card">
+      <h2>Active holding sessions (Rotation)</h2>
+      <div id="rotation-list" class="rotation-grid"></div>
+    </section>
+
+    <section class="card">
+      <h2>Live status</h2>
+      <div id="status-list" class="status-list"></div>
+    </section>
+
+    <section class="card">
+      <h2>Queue ranking (last 24h)</h2>
+      <table class="rank">
+        <thead>
+          <tr>
+            <th>#</th><th>Account</th><th>appId</th>
+            <th>Samples</th><th>Ready</th><th>Errors</th>
+            <th>Avg queue</th><th>p50</th><th>p95</th><th>Best</th><th>Last ready</th>
+          </tr>
+        </thead>
+        <tbody id="rank-body"></tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>Recent samples</h2>
+      <table class="rank">
+        <thead>
+          <tr>
+            <th>When</th><th>Account</th><th>Outcome</th>
+            <th>Queue ms</th><th>Pos</th><th>Error</th>
+          </tr>
+        </thead>
+        <tbody id="recent-body"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <div id="toast-container" class="toast-container" aria-live="polite" aria-atomic="true"></div>
+
+  <script src="/app.js" type="module"></script>
+</body>
+</html>

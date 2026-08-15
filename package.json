@@ -1,0 +1,23 @@
+{
+  "name": "opennow-queue-bot",
+  "version": "0.1.0",
+  "description": "Continuous GFN queue probe for OpenNOW — multi-account queue ranking",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "start:prod": "node dist/index.js"
+  },
+  "dependencies": {
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.17",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.22.3",
+    "typescript": "^5.9.3"
+  }
+}
