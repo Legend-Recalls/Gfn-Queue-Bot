@@ -7,6 +7,7 @@ import { AccountBot, AccountStatus, AccountBotConfig, ClaimInfo } from "./accoun
 import { MetricsStore } from "../metrics/store";
 import { FingerprintManager } from "../gfn/fingerprint";
 import { RateLimiter } from "./rateLimiter";
+import { ApiCircuitBreaker } from "./circuitBreaker";
 
 export interface BotConfig {
   appId: string;
@@ -38,9 +39,11 @@ interface ConfigFile {
   bot: BotConfig;
 }
 
+const MIN_POLL_INTERVAL_MS = 30_000;
+
 const DEFAULT_BOT_CONFIG: BotConfig = {
   appId: "",
-  pollIntervalMs: 4_000,
+  pollIntervalMs: 30_000,
   cooldownMs: 20_000,
   maxQueueMs: 30 * 60 * 1000,
   resolution: "1920x1080",
@@ -62,6 +65,7 @@ export class BotOrchestrator extends EventEmitter {
   private evaluateTimeout: NodeJS.Timeout | null = null;
   private readonly fingerprintManager: FingerprintManager;
   private readonly rateLimiter: RateLimiter;
+  private readonly circuitBreaker: ApiCircuitBreaker;
   private botConfigKeys = new Map<string, string>();
   private restartingBotIds = new Set<string>();
 
@@ -76,13 +80,25 @@ export class BotOrchestrator extends EventEmitter {
     this.fingerprintManager = new FingerprintManager(dataDir);
     // 10 requests per 10 seconds across all accounts
     this.rateLimiter = new RateLimiter(10, 10_000);
+    // Stop all session polling briefly after repeated API/network failures.
+    // The rolling window is shared so intermittent failures across accounts
+    // still trip protection without per-account backoff decay.
+    this.circuitBreaker = new ApiCircuitBreaker(5, 60_000, 60_000);
   }
 
   async loadConfig(): Promise<void> {
     try {
       const raw = await readFile(this.staticConfigPath, "utf8");
       const parsed = JSON.parse(raw) as Partial<ConfigFile>;
-      this.config = { ...DEFAULT_BOT_CONFIG, ...parsed.bot, profileAssignments: { ...DEFAULT_BOT_CONFIG.profileAssignments, ...parsed.bot?.profileAssignments } };
+      const loaded = {
+        ...DEFAULT_BOT_CONFIG,
+        ...parsed.bot,
+        profileAssignments: { ...DEFAULT_BOT_CONFIG.profileAssignments, ...parsed.bot?.profileAssignments },
+      };
+      this.config = {
+        ...loaded,
+        pollIntervalMs: Math.max(MIN_POLL_INTERVAL_MS, loaded.pollIntervalMs),
+      };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         console.warn("[Orchestrator] failed to load config:", error);
@@ -124,12 +140,16 @@ export class BotOrchestrator extends EventEmitter {
   }
 
   async updateConfig(patch: Partial<BotConfig>): Promise<BotConfig> {
-    this.config = {
+    const nextConfig = {
       ...this.config,
       ...patch,
       profileAssignments: patch.profileAssignments
         ? { ...patch.profileAssignments }
         : { ...this.config.profileAssignments },
+    };
+    this.config = {
+      ...nextConfig,
+      pollIntervalMs: Math.max(MIN_POLL_INTERVAL_MS, nextConfig.pollIntervalMs),
     };
     await this.persistConfig();
     this.reconcileBots();
@@ -232,7 +252,15 @@ export class BotOrchestrator extends EventEmitter {
     configKey = JSON.stringify(botConfig),
   ): void {
     const fingerprint = this.fingerprintManager.getOrCreate(account.user.userId);
-    const bot = new AccountBot(this.auth, this.metrics, account, botConfig, fingerprint, this.rateLimiter);
+    const bot = new AccountBot(
+      this.auth,
+      this.metrics,
+      account,
+      botConfig,
+      fingerprint,
+      this.rateLimiter,
+      this.circuitBreaker,
+    );
 
     bot.on("status", (status) => {
       this.triggerEvaluation();

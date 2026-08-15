@@ -106,7 +106,7 @@ function renderConfig() {
 
   $("cfg-resolution").value = c.resolution ?? "1920x1080";
   $("cfg-fps").value = c.fps ?? 60;
-  $("cfg-poll").value = c.pollIntervalMs ?? 4000;
+  $("cfg-poll").value = c.pollIntervalMs ?? 30000;
   $("cfg-cooldown").value = c.cooldownMs ?? 20000;
   $("cfg-max").value = c.maxQueueMs ?? 1800000;
   $("cfg-maxConcurrentHolding").value = c.maxConcurrentHolding ?? 2;

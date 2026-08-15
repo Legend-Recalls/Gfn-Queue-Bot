@@ -12,6 +12,7 @@ import {
 } from "../gfn/session";
 import type { DeviceFingerprint } from "../gfn/fingerprint";
 import type { MetricsStore, QueueSample } from "../metrics/store";
+import type { ApiCircuitBreaker } from "./circuitBreaker";
 import type { RateLimiter } from "./rateLimiter";
 
 export type AccountPhase =
@@ -69,14 +70,14 @@ export interface AccountBotConfig {
   sessionBufferMs?: number;
 }
 
-const DEFAULT_POLL_INTERVAL_MS = 4_000;
+const DEFAULT_POLL_INTERVAL_MS = 30_000;
 const DEFAULT_COOLDOWN_MS = 20_000;
 const DEFAULT_MAX_QUEUE_MS = 30 * 60 * 1000;
 const DEFAULT_SESSION_HOLD_MS = 55 * 60 * 1000;  // 55 minutes
 const DEFAULT_SESSION_BUFFER_MS = 5 * 60 * 1000; // 5 minutes
 const SESSION_LIMIT_COOLDOWN_MS = 2 * 60 * 1000;
 const REQUEST_LIMIT_COOLDOWN_MS = 5 * 60 * 1000;
-const HOLD_POLL_INTERVAL_MS = 30_000; // poll every 30s while holding (less aggressive)
+const HOLD_POLL_INTERVAL_MS = 2 * 60_000; // server-side hold checks can be much less frequent
 
 export interface ClaimInfo {
   userId: string;
@@ -107,6 +108,7 @@ export class AccountBot extends EventEmitter {
     private readonly config: AccountBotConfig,
     private readonly fingerprint?: DeviceFingerprint,
     private readonly rateLimiter?: RateLimiter,
+    private readonly circuitBreaker?: ApiCircuitBreaker,
   ) {
     super();
     this.userId = account.user.userId;
@@ -118,7 +120,7 @@ export class AccountBot extends EventEmitter {
       phase: "idle",
       appId: config.appId,
       streamingBaseUrl: this.streamingBaseUrl,
-      pollIntervalMs: config.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
+      pollIntervalMs: Math.max(DEFAULT_POLL_INTERVAL_MS, config.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS),
       lastUpdateAt: Date.now(),
       consecutiveErrors: 0,
     };
@@ -294,12 +296,11 @@ export class AccountBot extends EventEmitter {
   private scheduleNext(delayMs: number): void {
     if (this.stopping) return;
     this.clearTimer();
-    // Apply ±20% jitter to break metronomic poll patterns
-    const jitter = delayMs > 0 ? delayMs * (0.8 + Math.random() * 0.4) : 0;
+    // Poll on an explicit fixed interval; errors do not change the delay.
     this.timer = setTimeout(() => {
       this.timer = null;
       void this.runCycle();
-    }, Math.round(jitter));
+    }, Math.max(0, Math.round(delayMs)));
   }
 
   private setStatus(patch: Partial<AccountStatus>): void {
@@ -376,10 +377,9 @@ export class AccountBot extends EventEmitter {
   private scheduleNextForPhase(): void {
     const phase = this.status.phase;
     if (phase === "queueing" || phase === "ready") {
-      const delayMs = this.status.consecutiveErrors > 0
-        ? Math.min(60_000, this.status.pollIntervalMs * 2 ** this.status.consecutiveErrors)
-        : this.status.pollIntervalMs;
-      this.scheduleNext(delayMs);
+      // Poll at the configured fixed interval. API failures are handled by the
+      // shared circuit breaker, never by per-account adaptive backoff.
+      this.scheduleNext(this.status.pollIntervalMs);
     } else if (phase === "holding") {
       // Check if hold has expired
       if (this.holdRemainingMs <= 0) {
@@ -401,8 +401,7 @@ export class AccountBot extends EventEmitter {
       this.scheduleNext(Math.max(0, until - Date.now()));
     } else if (phase === "error") {
       if (this.queueRequested) {
-        const backoff = Math.min(60_000, 2_000 * 2 ** this.status.consecutiveErrors);
-        this.scheduleNext(backoff);
+        this.scheduleNext(this.status.pollIntervalMs);
       }
     } else {
       if (this.queueRequested) {
@@ -411,8 +410,64 @@ export class AccountBot extends EventEmitter {
     }
   }
 
+  private canCallApi(): boolean {
+    if (this.circuitBreaker && !this.circuitBreaker.tryAcquire()) {
+      this.setStatus({ lastError: "API circuit breaker open" });
+      return false;
+    }
+    return true;
+  }
+
+  private recordApiSuccess(): void {
+    this.circuitBreaker?.recordSuccess();
+  }
+
+  private recordApiFailure(error: unknown): void {
+    if (!this.circuitBreaker) return;
+    if (this.isCircuitFailure(error)) {
+      this.circuitBreaker.recordFailure();
+    } else {
+      // A structured application response proves the API is reachable.
+      this.circuitBreaker.recordSuccess();
+    }
+  }
+
+  private isCircuitFailure(error: unknown): boolean {
+    if (error instanceof SessionError) {
+      return error.statusCode === 0 || error.statusCode === 408 || error.statusCode >= 500 ||
+        /invalid response body|invalid json|timeout|temporar/i.test(error.statusDescription);
+    }
+    if (!(error instanceof Error)) return true;
+    return /fetch failed|UND_ERR_SOCKET|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket|network|timeout|temporar/i.test(error.message);
+  }
+
+  /** Shared session polling request used by queueing and holding phases. */
+  private async fetchSession(token: string): Promise<SessionInfo | null | undefined> {
+    if (!this.status.sessionId || !this.canCallApi()) return undefined;
+    try {
+      const info = await pollSession({
+        token,
+        sessionId: this.status.sessionId,
+        zone: this.config.zone ?? "",
+        serverIp: this.status.serverIp,
+        streamingBaseUrl: this.status.streamingBaseUrl ?? this.streamingBaseUrl,
+        fingerprint: this.fingerprint,
+      });
+      this.recordApiSuccess();
+      return info;
+    } catch (error) {
+      if (error instanceof Error && /404|not[_\\s-]?found/i.test(error.message)) {
+        this.recordApiSuccess();
+        return null;
+      }
+      this.recordApiFailure(error);
+      throw error;
+    }
+  }
+
   private async startNewSession(token: string): Promise<void> {
     this.setStatus({ phase: "starting", lastError: undefined });
+    if (!this.canCallApi()) return;
     try {
       const session = await createSession({
         token,
@@ -425,6 +480,7 @@ export class AccountBot extends EventEmitter {
         },
         fingerprint: this.fingerprint,
       });
+      this.recordApiSuccess();
       const sample: QueueSample = {
         userId: this.userId,
         appId: this.config.appId,
@@ -447,6 +503,7 @@ export class AccountBot extends EventEmitter {
         await this.onReachedReady(session);
       }
     } catch (error) {
+      this.recordApiFailure(error);
       if (await this.handleSessionCreateLimit(token, error)) return;
       this.handleCycleError(error);
     }
@@ -503,26 +560,15 @@ export class AccountBot extends EventEmitter {
 
   private async poll(token: string): Promise<void> {
     if (!this.status.sessionId) return;
-    let info: SessionInfo;
-    try {
-      info = await pollSession({
-        token,
-        sessionId: this.status.sessionId,
-        zone: this.config.zone ?? "",
-        serverIp: this.status.serverIp,
-        streamingBaseUrl: this.status.streamingBaseUrl ?? this.streamingBaseUrl,
-        fingerprint: this.fingerprint,
-      });
-    } catch (error) {
-      if (error instanceof Error && /404|not[_\s-]?found/i.test(error.message)) {
-        this.metrics.updateSample(
-          (s) => s.userId === this.userId && s.outcome === "running",
-          { outcome: "stopped", endedAt: Date.now() },
-        );
-        this.setStatus({ sessionId: undefined, serverIp: undefined, queuePosition: undefined, phase: "idle" });
-        return;
-      }
-      throw error;
+    const info = await this.fetchSession(token);
+    if (info === undefined) return;
+    if (info === null) {
+      this.metrics.updateSample(
+        (s) => s.userId === this.userId && s.outcome === "running",
+        { outcome: "stopped", endedAt: Date.now() },
+      );
+      this.setStatus({ sessionId: undefined, serverIp: undefined, queuePosition: undefined, phase: "idle" });
+      return;
     }
 
     this.setStatus({
@@ -560,39 +606,28 @@ export class AccountBot extends EventEmitter {
       return;
     }
 
-    let info: SessionInfo;
-    try {
-      info = await pollSession({
-        token,
-        sessionId: this.status.sessionId,
-        zone: this.config.zone ?? "",
-        serverIp: this.status.serverIp,
-        streamingBaseUrl: this.status.streamingBaseUrl ?? this.streamingBaseUrl,
-        fingerprint: this.fingerprint,
+    const info = await this.fetchSession(token);
+    if (info === undefined) return;
+    if (info === null) {
+      // Session was killed server-side while we were holding
+      console.warn(`[Bot:${this.userId}] Session disappeared during hold`);
+      this.metrics.updateSample(
+        (s) => s.userId === this.userId && (s.outcome === "running" || s.outcome === "ready"),
+        { outcome: "stopped", endedAt: Date.now() },
+      );
+      this.setStatus({
+        phase: "cooldown",
+        sessionId: undefined,
+        serverIp: undefined,
+        streamingBaseUrl: this.streamingBaseUrl,
+        queuePosition: undefined,
+        holdStartedAt: undefined,
+        holdExpiresAt: undefined,
+        cooldownUntil: Date.now() + (this.config.cooldownMs ?? DEFAULT_COOLDOWN_MS),
       });
-    } catch (error) {
-      if (error instanceof Error && /404|not[_\s-]?found/i.test(error.message)) {
-        // Session was killed server-side while we were holding
-        console.warn(`[Bot:${this.userId}] Session disappeared during hold`);
-        this.metrics.updateSample(
-          (s) => s.userId === this.userId && (s.outcome === "running" || s.outcome === "ready"),
-          { outcome: "stopped", endedAt: Date.now() },
-        );
-        this.setStatus({
-          phase: "cooldown",
-          sessionId: undefined,
-          serverIp: undefined,
-          streamingBaseUrl: this.streamingBaseUrl,
-          queuePosition: undefined,
-          holdStartedAt: undefined,
-          holdExpiresAt: undefined,
-          cooldownUntil: Date.now() + (this.config.cooldownMs ?? DEFAULT_COOLDOWN_MS),
-        });
-        this.holdReadyEmitted = false;
-        this.emit("hold-ended", { ...this.status, reason: "server-side expiry" });
-        return;
-      }
-      throw error;
+      this.holdReadyEmitted = false;
+      this.emit("hold-ended", { ...this.status, reason: "server-side expiry" });
+      return;
     }
 
     // If GFN ended the session or it's no longer ready/streaming, end hold
@@ -788,14 +823,13 @@ export class AccountBot extends EventEmitter {
       (s) => s.userId === this.userId && s.outcome === "running",
       { outcome: "error", endedAt: Date.now(), errorMessage: message },
     );
-    const backoffMs = Math.min(120_000, 5_000 * 2 ** Math.min(consecutive - 1, 4));
+    const nextPhase = this.status.sessionId ? this.status.phase : "error";
     this.setStatus({
-      phase: "cooldown",
+      phase: nextPhase,
       lastError: message,
       consecutiveErrors: consecutive,
-      cooldownUntil: Date.now() + backoffMs,
     });
-    console.error(`[Bot:${this.userId}] cycle error; backing off ${Math.round(backoffMs / 1000)}s:`, message);
+    console.error(`[Bot:${this.userId}] cycle error; retrying at the fixed poll interval:`, message);
   }
 
   /**
